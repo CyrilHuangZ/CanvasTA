@@ -1,0 +1,26 @@
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Virtual/conda
+.venv/
+venv/
+.conda/
+
+# Runtime outputs
+Results/
+student_submissions/
+*.log
+
+# Notebook artifacts
+.ipynb_checkpoints/
+
+# Local test or personal materials
+测试文件/

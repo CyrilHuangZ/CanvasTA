@@ -1,0 +1,7 @@
+requests
+canvasapi
+PyMuPDF
+python-docx
+ipykernel
+streamlit
+python-dotenv
