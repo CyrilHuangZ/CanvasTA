@@ -127,7 +127,8 @@ class AnswerExtractor:
         if not answer_file or not answer_file.exists():
             raise FileNotFoundError(
                 f"未找到标准答案文件: {answer_file}\n"
-                "请将答案文件放入 Answer/ 目录，或设置 ANSWER_FILE。"
+                "请将答案文件放入 Answer/ 目录（文件名包含 ASSIGNMENT_ID，支持 txt/md/pdf/docx/图片），"
+                "或设置有效的 ANSWER_FILE。"
             )
         route, text = self.route_and_extract(answer_file)
         if route == "text":

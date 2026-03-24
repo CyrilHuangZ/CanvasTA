@@ -54,8 +54,8 @@ class CanvasService:
             files.append(SubmissionFile(name=save_name, path=save_path))
         return files
 
-    def submit_grade_and_comment(self, submission, total_score, comment: str) -> None:
-        submission.edit(
-            submission={"posted_grade": total_score},
-            comment={"text_comment": comment},
-        )
+    def submit_grade_and_comment(self, submission, total_score, comment: str | None = None) -> None:
+        payload = {"submission": {"posted_grade": total_score}}
+        if comment and comment.strip():
+            payload["comment"] = {"text_comment": comment}
+        submission.edit(**payload)

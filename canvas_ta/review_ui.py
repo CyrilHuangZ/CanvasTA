@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import base64
 import json
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
+
+try:
+    from docx import Document  # type: ignore
+except Exception:
+    Document = None
 
 try:
     from canvas_ta.config import Settings
@@ -21,7 +29,7 @@ except ImportError:
 st.set_page_config(page_title="CanvasTA 审阅台", layout="wide")
 
 settings = Settings()
-results_dir = settings.results_dir
+results_dir = settings.assignment_results_dir
 project_root = Path(__file__).resolve().parent.parent
 logo_path = project_root / "Logo" / "CanvasTA.png"
 
@@ -29,14 +37,63 @@ if logo_path.exists():
     st.image(str(logo_path), width=180)
 
 st.title("CanvasTA 一体化工作台")
-st.caption("支持一站式完成批改、审阅、审核标记与回传。")
+st.caption(f"支持一站式完成批改、审阅、审核标记与回传。当前作业ID: {settings.assignment_id}")
 # 主操作界面已移除顶部声明，免责声明保留在侧边栏以避免干扰主操作流程
 
 with st.sidebar:
     st.header("流程控制")
-    if st.button("1) 拉取并批改作业", use_container_width=True):
+    total_questions_input = st.number_input(
+        "题目总数（可选）",
+        min_value=0,
+        value=settings.total_questions or 0,
+        step=1,
+        help="用于让模型在总分和分题扣分上更稳定；留空可填0。",
+    )
+
+    allow_run_with_zero = False
+    if total_questions_input == 0:
+        st.warning("题目总数当前为 0，请重新检查。")
+        allow_run_with_zero = st.checkbox(
+            "我已重新检查，确认本次按题目总数为 0 执行",
+            value=False,
+            key="confirm_zero_questions",
+        )
+
+    progress_text_slot = st.empty()
+    progress_bar_slot = st.progress(0)
+
+    can_start_grading = total_questions_input > 0 or allow_run_with_zero
+    if st.button("1) 拉取并批改作业", use_container_width=True, disabled=not can_start_grading):
+        def _on_grading_progress(event: dict) -> None:
+            stage = str(event.get("stage", ""))
+            current = int(event.get("current", 0) or 0)
+            total = int(event.get("total", 0) or 0)
+            stage_label = {
+                "ready": "准备完成",
+                "start": "开始批改",
+                "downloading": "下载作业中",
+                "grading": "批改作业中",
+                "saved": "结果保存中",
+                "done": "批改完成",
+            }.get(stage, "处理中")
+
+            if total > 0:
+                progress_value = min(100, max(0, int((current / total) * 100)))
+                progress_bar_slot.progress(progress_value)
+                progress_text_slot.info(
+                    f"{stage_label}：第 {min(current, total)} / {total} 份 | {event.get('message', '')}"
+                )
+            else:
+                progress_bar_slot.progress(0)
+                progress_text_slot.info(f"{stage_label}：{event.get('message', '')}")
+
         with st.spinner("正在批改中，这可能需要几分钟..."):
-            run_grading_pipeline()
+            run_grading_pipeline(
+                grading_total_questions=int(total_questions_input) if total_questions_input > 0 else None,
+                progress_callback=_on_grading_progress,
+            )
+        progress_bar_slot.progress(100)
+        progress_text_slot.success("批改任务已完成")
         st.success("批改完成，已刷新结果列表")
         st.rerun()
 
@@ -58,6 +115,55 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _render_pdf(file_path: Path) -> None:
+    data = file_path.read_bytes()
+    encoded = base64.b64encode(data).decode("utf-8")
+    iframe = (
+        f'<iframe src="data:application/pdf;base64,{encoded}" '
+        'width="100%" height="700" type="application/pdf"></iframe>'
+    )
+    components.html(iframe, height=720, scrolling=True)
+
+
+def _render_docx(file_path: Path) -> None:
+    if Document is None:
+        st.info("当前环境缺少 python-docx，无法内嵌预览 docx，可下载后本地打开。")
+        st.download_button("下载原始 DOCX", data=file_path.read_bytes(), file_name=file_path.name)
+        return
+    doc = Document(BytesIO(file_path.read_bytes()))
+    raw_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    st.text_area("原始 DOCX 文本", value=raw_text, height=520, disabled=True)
+
+
+def _render_source_file(file_path: Path) -> None:
+    if not file_path.exists():
+        st.warning(f"附件文件不存在: {file_path}")
+        return
+
+    suffix = file_path.suffix.lower()
+    st.caption(f"文件: {file_path.name} ({suffix or '未知类型'})")
+
+    if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
+        st.image(str(file_path), use_container_width=True)
+        return
+
+    if suffix == ".pdf":
+        _render_pdf(file_path)
+        return
+
+    if suffix in {".txt", ".md", ".csv", ".json", ".py"}:
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+        st.text_area("原始文本", value=text, height=520, disabled=True)
+        return
+
+    if suffix == ".docx":
+        _render_docx(file_path)
+        return
+
+    st.info("该文件类型暂不支持内嵌预览，可下载后查看。")
+    st.download_button("下载原始附件", data=file_path.read_bytes(), file_name=file_path.name)
 
 
 def _save_current_file(current_path: Path, data: dict, key_prefix: str) -> None:
@@ -118,14 +224,20 @@ left, right = st.columns(2)
 
 with left:
     st.markdown("### 学生作业")
-    st.write(f"来源文件: {data.get('student_source_file', '未知')}")
-    st.text_area(
-        "提取文本",
-        value=data.get("student_answer_text", "(无提取文本或提取失败)"),
-        height=520,
-        key=f"{key_prefix}_student_text_view",
-        disabled=True,
-    )
+    source_files = [Path(p) for p in data.get("student_source_files", []) if p]
+    if not source_files and data.get("student_source_file"):
+        source_files = [Path(data["student_source_file"])]
+
+    if not source_files:
+        st.warning("未记录到原始附件路径")
+    elif len(source_files) == 1:
+        _render_source_file(source_files[0])
+    else:
+        tab_titles = [p.name for p in source_files]
+        tabs = st.tabs(tab_titles)
+        for tab, src in zip(tabs, source_files):
+            with tab:
+                _render_source_file(src)
 
 with right:
     st.markdown("### 教师可编辑评分区")
