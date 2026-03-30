@@ -194,6 +194,35 @@ streamlit run canvas_ta/review_ui.py
 
 ---
 
+### Standard Answer Format (Recommended)
+
+To keep extraction stable and make UI rendering predictable, maintain standard answers in Markdown style.
+
+Recommended file location and naming:
+
+- Place files under `Answer/`
+- Include assignment id in file name, for example: `Hw1 Solution 35418.md`
+- Keep legacy `.txt` as backup only; maintain `.md` as the source of truth
+
+Recommended structure:
+
+- Use level-2 headers per question, e.g. `## 2.1 ...`, `## 2.2 ...`
+- Keep one question block contiguous (avoid mixing multiple questions in one block)
+- Use standard Markdown lists and paragraphs
+
+Math writing recommendations:
+
+- Inline math: `$x^2 + y^2$`
+- Block math: `$$ ... $$`
+- Avoid using bare `[` `]` as math delimiters in newly maintained files
+
+Compatibility notes:
+
+- The UI can map grading items `1..n` to section ids such as `2.1..2.n` by the last segment.
+- If a question cannot find a matching standard answer, first verify header numbering consistency.
+
+---
+
 ### Project Structure
 
 - `canvas_ta/config.py`: configuration parsing (multi-provider support)
@@ -399,6 +428,35 @@ python run_grading.py
 python submit_results.py
 streamlit run canvas_ta/review_ui.py
 ```
+
+---
+
+### 标准答案格式要求（建议）
+
+为保证提取稳定、UI 展示一致，建议将标准答案维护为 Markdown 风格。
+
+推荐文件位置与命名：
+
+- 放在 `Answer/` 目录
+- 文件名包含作业 id，例如：`Hw1 Solution 35418.md`
+- 原 `.txt` 可保留作备份，后续以 `.md` 作为主维护版本
+
+推荐结构：
+
+- 每题使用二级标题，例如 `## 2.1 ...`、`## 2.2 ...`
+- 每题内容保持连续，不要把多题混在一个区块
+- 正文使用标准 Markdown 段落/列表
+
+公式书写建议：
+
+- 行内公式：`$x^2 + y^2$`
+- 块级公式：`$$ ... $$`
+- 新维护文件尽量不要再使用裸 `[` `]` 作为公式块分隔
+
+兼容性说明：
+
+- 当前 UI 支持将评分项 `1..n` 与标准答案 `2.1..2.n` 按末级题号自动匹配。
+- 若某题未显示标准答案，优先检查标题题号是否连续且一致。
 
 ---
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +38,9 @@ def _write_result_with_history(
 
 def run_grading_pipeline(
     grading_total_questions: int | None = None,
+    retry_failed_only: bool = False,
+    skip_approved: bool = True,
+    reuse_valid_results: bool = False,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     settings = Settings()
@@ -93,6 +98,49 @@ def run_grading_pipeline(
         user_id = submission.user_id
         print(f"\n[{student_name}] 开始处理")
 
+        existing_path = _result_path(results_dir, student_name)
+        existing_data: dict[str, Any] = {}
+        if existing_path.exists():
+            try:
+                existing_data = json.loads(existing_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing_data = {}
+
+        existing_result_is_valid = _is_valid_existing_result(existing_data)
+
+        should_download_only = reuse_valid_results and existing_result_is_valid
+        if should_download_only and retry_failed_only:
+            should_download_only = False
+
+        if (not reuse_valid_results) and skip_approved and existing_data.get("approved", False):
+            skip_count += 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": "saved",
+                        "message": f"跳过（已审核）: {student_name}",
+                        "current": current_no,
+                        "total": total_submitted,
+                        "student_name": student_name,
+                    }
+                )
+            continue
+
+        if retry_failed_only and existing_data:
+            if not existing_data.get("needs_retry", False):
+                skip_count += 1
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "stage": "saved",
+                            "message": f"跳过（非重试目标）: {student_name}",
+                            "current": current_no,
+                            "total": total_submitted,
+                            "student_name": student_name,
+                        }
+                    )
+                continue
+
         if progress_callback:
             progress_callback(
                 {
@@ -105,6 +153,42 @@ def run_grading_pipeline(
             )
 
         attachments = canvas.download_attachments(submission, download_dir)
+
+        if should_download_only:
+            source_paths = [a.path for a in attachments]
+            expanded_paths = extractor.expand_student_files(source_paths)
+            preview_paths = expanded_paths if expanded_paths else source_paths
+            updated_data = dict(existing_data)
+            updated_data["run_id"] = run_id
+            updated_data["files"] = [a.name for a in attachments]
+            updated_data["student_source_files"] = [str(p) for p in source_paths]
+            # Keep preview stable after reset-download-dir and support archive submissions.
+            updated_data["parsed_source_files"] = [str(p) for p in preview_paths]
+            updated_data.setdefault("student_name", student_name)
+            updated_data.setdefault("user_id", user_id)
+            updated_data.setdefault("assignment_id", settings.assignment_id)
+
+            _write_result_with_history(
+                latest_dir=results_dir,
+                history_dir=history_dir,
+                run_id=run_id,
+                student_name=student_name,
+                data=updated_data,
+            )
+
+            skip_count += 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": "saved",
+                        "message": f"仅下载并跳过重批（已有有效结果）: {student_name}",
+                        "current": current_no,
+                        "total": total_submitted,
+                        "student_name": student_name,
+                    }
+                )
+            continue
+
         if not attachments:
             skip_count += 1
             data = {
@@ -135,7 +219,7 @@ def run_grading_pipeline(
                 )
             continue
 
-        target = attachments[0].path
+        source_paths = [a.path for a in attachments]
 
         try:
             if progress_callback:
@@ -149,7 +233,7 @@ def run_grading_pipeline(
                     }
                 )
 
-            route, student_text = extractor.load_student_answer(target)
+            route, student_text, parsed_files = extractor.load_student_answers(source_paths)
             if not student_text:
                 raise ValueError("提取到的文本为空")
 
@@ -165,14 +249,16 @@ def run_grading_pipeline(
                 "run_id": run_id,
                 "files": [a.name for a in attachments],
                 "student_source_files": [str(a.path) for a in attachments],
-                "student_source_file": str(target),
+                "parsed_source_files": parsed_files,
                 "extract_route": route,
                 "student_answer_text": student_text,
                 "grading": grading,
                 "approved": False,
+                "needs_retry": False,
             }
             ok_count += 1
         except Exception as exc:
+            retryable = _is_retryable_error(str(exc))
             result_data = {
                 "student_name": student_name,
                 "user_id": user_id,
@@ -180,9 +266,9 @@ def run_grading_pipeline(
                 "run_id": run_id,
                 "files": [a.name for a in attachments],
                 "student_source_files": [str(a.path) for a in attachments],
-                "student_source_file": str(target),
                 "approved": False,
                 "error": str(exc),
+                "needs_retry": retryable,
             }
             err_count += 1
 
@@ -221,12 +307,98 @@ def run_grading_pipeline(
         )
 
 
+def _is_retryable_error(error_text: str) -> bool:
+    if not error_text:
+        return False
+
+    normalized = error_text.lower()
+    retry_keywords = [
+        "read timed out",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "temporarily unavailable",
+        "too many requests",
+        "429",
+        "502",
+        "503",
+        "504",
+    ]
+    return any(word in normalized for word in retry_keywords)
+
+
+def _is_valid_existing_result(data: dict[str, Any]) -> bool:
+    if not isinstance(data, dict) or not data:
+        return False
+
+    if data.get("error"):
+        return False
+
+    grading = data.get("grading")
+    if not isinstance(grading, dict):
+        return False
+
+    total_score = grading.get("total_score")
+    if isinstance(total_score, bool) or not isinstance(total_score, (int, float)):
+        return False
+
+    items = grading.get("items")
+    if items is not None and not isinstance(items, list):
+        return False
+
+    return True
+
+
 def submit_approved_results() -> None:
     settings = Settings()
     success, skipped, failed = submit_approved_results_with_stats(settings=settings)
 
     print("\n" + "=" * 60)
     print(f"提交完成: 成功 {success} | 跳过 {skipped} | 失败 {failed}")
+
+
+def compact_submission_cache(*, dry_run: bool = False) -> tuple[int, int, Path]:
+    settings = Settings()
+    settings.ensure_dirs()
+    download_dir = settings.assignment_download_dir
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = download_dir / "_cache_archive" / run_id
+
+    duplicate_files: list[Path] = []
+    # Legacy downloader used suffixes like *_1.pdf, *_2.jpg. Only archive them if base file exists.
+    for file_path in download_dir.glob("*"):
+        if not file_path.is_file():
+            continue
+
+        match = re.match(r"^(?P<base>.+)_(?P<idx>\d+)$", file_path.stem)
+        if not match:
+            continue
+
+        base_name = match.group("base") + file_path.suffix
+        base_path = file_path.with_name(base_name)
+        if base_path.exists() and base_path.is_file():
+            duplicate_files.append(file_path)
+
+    unzip_dirs = [
+        p
+        for p in download_dir.glob("*")
+        if p.is_dir() and p.name.endswith("__unzipped")
+    ]
+
+    if dry_run:
+        return len(duplicate_files), len(unzip_dirs), archive_dir
+
+    if duplicate_files or unzip_dirs:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+    for file_path in duplicate_files:
+        shutil.move(str(file_path), str(archive_dir / file_path.name))
+
+    for dir_path in unzip_dirs:
+        shutil.move(str(dir_path), str(archive_dir / dir_path.name))
+
+    return len(duplicate_files), len(unzip_dirs), archive_dir
 
 
 def _build_comment_lines(grading: dict[str, Any]) -> list[str]:
@@ -262,7 +434,9 @@ def _submit_one_data(
 ) -> tuple[bool, str]:
     student_name = data.get("student_name", "")
 
-    if data.get("error"):
+    manual_override = bool(data.get("manual_review_override", False))
+
+    if data.get("error") and not manual_override:
         return False, f"跳过 {student_name}: 评分结果有错误"
 
     if not data.get("approved", False):
@@ -270,6 +444,9 @@ def _submit_one_data(
 
     grading = data.get("grading", {})
     total_score = grading.get("total_score")
+    if total_score is None:
+        return False, f"失败 {student_name}: 缺少总分，无法回传"
+
     lines = _build_comment_lines(grading)
 
     submission = submissions_by_name.get(student_name)

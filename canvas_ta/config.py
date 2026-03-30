@@ -17,6 +17,13 @@ def _as_optional_int(value: str) -> int | None:
     return int(raw)
 
 
+def _as_float(value: str, default: float) -> float:
+    raw = (value or "").strip()
+    if not raw:
+        return default
+    return float(raw)
+
+
 def _load_dotenv_with_library(dotenv_path: Path) -> bool:
     try:
         from dotenv import load_dotenv  # type: ignore
@@ -86,7 +93,16 @@ class Settings:
     vision_model: str = os.getenv("VISION_MODEL", "qwen2.5-vl-72b-instruct")
     grading_model: str = os.getenv("GRADING_MODEL", "deepseek-v3.1")
     request_timeout: int = int(os.getenv("REQUEST_TIMEOUT", "180"))
+    llm_max_retries: int = int(os.getenv("LLM_MAX_RETRIES", "2"))
+    llm_retry_backoff_seconds: float = _as_float(
+        os.getenv("LLM_RETRY_BACKOFF_SECONDS", "2.0"),
+        2.0,
+    )
     max_vision_pages: int = int(os.getenv("MAX_VISION_PAGES", "5"))
+    vision_image_target_kb: int = int(os.getenv("VISION_IMAGE_TARGET_KB", "200"))
+    vision_render_dpi: int = int(os.getenv("VISION_RENDER_DPI", "160"))
+    vision_jpeg_quality: int = int(os.getenv("VISION_JPEG_QUALITY", "72"))
+    vision_max_width: int = int(os.getenv("VISION_MAX_WIDTH", "1600"))
 
     root_dir: Path = Path(os.getenv("ROOT_DIR", "."))
     download_dir: Path = Path(os.getenv("DOWNLOAD_DIR", "./student_submissions"))

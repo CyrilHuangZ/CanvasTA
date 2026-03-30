@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-import base64
 import json
+import shutil
 from datetime import datetime
 from io import BytesIO
+from functools import lru_cache
 from pathlib import Path
+import re
 
 import streamlit as st
-import streamlit.components.v1 as components
+
+try:
+    import fitz  # type: ignore
+except Exception:
+    fitz = None
 
 try:
     from docx import Document  # type: ignore
@@ -27,6 +33,36 @@ except ImportError:
 
 
 st.set_page_config(page_title="CanvasTA 审阅台", layout="wide")
+
+
+def _safe_reset_download_dir(target_dir: Path) -> tuple[bool, str]:
+    target_dir = target_dir.resolve()
+    parent = target_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    if not target_dir.exists():
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return True, f"下载目录不存在，已创建: {target_dir}"
+
+    try:
+        shutil.rmtree(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return True, f"已重置下载目录: {target_dir}"
+    except PermissionError:
+        # Windows 下若目录被占用，采用改名隔离避免页面崩溃。
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        quarantined = parent / f"{target_dir.name}__locked_{stamp}"
+        try:
+            target_dir.rename(quarantined)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            return True, f"目录占用，已隔离为: {quarantined.name}；并创建新目录: {target_dir.name}"
+        except Exception as exc:
+            return False, (
+                f"重置失败（目录被占用）: {target_dir}。"
+                f"请关闭资源管理器预览/编辑器占用后重试。详细信息: {exc}"
+            )
+    except Exception as exc:
+        return False, f"重置下载目录失败: {exc}"
 
 settings = Settings()
 results_dir = settings.assignment_results_dir
@@ -59,11 +95,60 @@ with st.sidebar:
             key="confirm_zero_questions",
         )
 
+    retry_failed_only = st.checkbox(
+        "仅重试上次可重试错误（超时/限流等）",
+        value=False,
+        help="开启后只会重跑上次标记 needs_retry=true 的学生。",
+    )
+    include_approved = st.checkbox(
+        "重跑已审核学生（谨慎）",
+        value=False,
+        help="默认会跳过已审核学生，避免覆盖人工审核结果。",
+    )
+    reuse_valid_results = st.checkbox(
+        "复用已有正常结果（仅下载不重批）",
+        value=True,
+        help="若已有 JSON 且无 error 并含 total_score，则只下载附件，不重新调用模型批改。",
+    )
+    reset_download_dir = st.checkbox(
+        "批改前清空本作业下载目录",
+        value=False,
+        help="仅清空 student_submissions/assignment_xxx，不影响 Results 与历史批改记录。",
+    )
+
+    st.divider()
+    st.subheader("标准答案显示")
+    standard_window_height = st.slider(
+        "标准答案滑窗高度",
+        min_value=120,
+        max_value=720,
+        value=320,
+        step=20,
+        help="每题标准答案仅保留一个滚动窗口，内容完整渲染。",
+    )
+    student_window_height = st.slider(
+        "学生作业滑窗高度",
+        min_value=240,
+        max_value=900,
+        value=520,
+        step=20,
+        help="学生附件预览区采用固定高度滚动窗口，避免页面过长。",
+    )
+
     progress_text_slot = st.empty()
     progress_bar_slot = st.progress(0)
 
     can_start_grading = total_questions_input > 0 or allow_run_with_zero
     if st.button("1) 拉取并批改作业", use_container_width=True, disabled=not can_start_grading):
+        if reset_download_dir:
+            target_dir = settings.assignment_download_dir
+            ok, msg = _safe_reset_download_dir(target_dir)
+            if ok:
+                st.info(msg)
+            else:
+                st.error(msg)
+                st.stop()
+
         def _on_grading_progress(event: dict) -> None:
             stage = str(event.get("stage", ""))
             current = int(event.get("current", 0) or 0)
@@ -90,6 +175,9 @@ with st.sidebar:
         with st.spinner("正在批改中，这可能需要几分钟..."):
             run_grading_pipeline(
                 grading_total_questions=int(total_questions_input) if total_questions_input > 0 else None,
+                retry_failed_only=retry_failed_only,
+                skip_approved=not include_approved,
+                reuse_valid_results=reuse_valid_results,
                 progress_callback=_on_grading_progress,
             )
         progress_bar_slot.progress(100)
@@ -117,14 +205,224 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return default
 
 
-def _render_pdf(file_path: Path) -> None:
-    data = file_path.read_bytes()
-    encoded = base64.b64encode(data).decode("utf-8")
-    iframe = (
-        f'<iframe src="data:application/pdf;base64,{encoded}" '
-        'width="100%" height="700" type="application/pdf"></iframe>'
+def _score_ratio(score: float, max_score: float) -> float:
+    if max_score <= 0:
+        return 0.0
+    return max(0.0, min(1.0, score / max_score))
+
+
+def _interpolate_color_hex(ratio: float) -> str:
+    # Pleasant palette: low=#e76f51, mid=#e9c46a, high=#2a9d8f
+    low = (231, 111, 81)
+    mid = (233, 196, 106)
+    high = (42, 157, 143)
+
+    if ratio <= 0.5:
+        t = ratio / 0.5
+        start, end = low, mid
+    else:
+        t = (ratio - 0.5) / 0.5
+        start, end = mid, high
+
+    r = int(start[0] + (end[0] - start[0]) * t)
+    g = int(start[1] + (end[1] - start[1]) * t)
+    b = int(start[2] + (end[2] - start[2]) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _render_score_bar(score: float, max_score: float) -> None:
+    ratio = _score_ratio(score, max_score)
+    width = int(ratio * 100)
+    bar_color = _interpolate_color_hex(ratio)
+    st.markdown(
+        f"""
+<div style="margin: 2px 0 10px 0;">
+  <div style="display:flex; justify-content:space-between; font-size:12px; color:#5b5f66;">
+    <span>得分热度</span>
+    <span>{width}%</span>
+  </div>
+  <div style="height:10px; background:#eef1f5; border-radius:999px; overflow:hidden;">
+    <div style="height:100%; width:{width}%; background:{bar_color}; transition:width .25s ease;"></div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
     )
-    components.html(iframe, height=720, scrolling=True)
+
+
+def _heat_badge_text(score: float, max_score: float) -> str:
+    ratio = _score_ratio(score, max_score)
+    pct = int(ratio * 100)
+    if pct >= 85:
+        icon = "🟢"
+    elif pct >= 70:
+        icon = "🟡"
+    elif pct >= 50:
+        icon = "🟠"
+    else:
+        icon = "🔴"
+    return f"{icon} {pct}%"
+
+
+@lru_cache(maxsize=1)
+def _load_standard_answer_text() -> str:
+    answer_file = settings.answer_file
+    if not answer_file.exists() or not answer_file.is_file():
+        return ""
+
+    suffix = answer_file.suffix.lower()
+    if suffix in {".txt", ".md", ".tex"}:
+        try:
+            return answer_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return answer_file.read_text(encoding="gb18030", errors="ignore")
+    return ""
+
+
+@lru_cache(maxsize=1)
+def _standard_answer_map() -> dict[str, str]:
+    text = _load_standard_answer_text().strip()
+    if not text:
+        return {}
+
+    normalized = text.replace("\r\n", "\n")
+    lines = normalized.split("\n")
+    headers: list[tuple[str, int]] = []
+
+    markdown_q = re.compile(r"^\s*#{1,6}\s*([0-9]+(?:\.[0-9]+)*)\b")
+    chinese_q = re.compile(r"^\s*题\s*([0-9]+(?:\.[0-9]+)*)\s*[：:.、．]?")
+
+    for i, line in enumerate(lines):
+        m1 = markdown_q.match(line)
+        if m1:
+            headers.append((m1.group(1), i))
+            continue
+        m2 = chinese_q.match(line)
+        if m2:
+            headers.append((m2.group(1), i))
+
+    if not headers:
+        return {}
+
+    result: dict[str, str] = {}
+    for i, (q_no, line_idx) in enumerate(headers):
+        if not q_no:
+            continue
+        start_line = line_idx + 1
+        end_line = headers[i + 1][1] if i + 1 < len(headers) else len(lines)
+        chunk = "\n".join(lines[start_line:end_line]).strip()
+        if chunk:
+            result[q_no] = chunk
+    return result
+
+
+def _normalize_markdown_math_blocks(text: str) -> str:
+    # Convert legacy block math markers `[` ... `]` into streamlit-friendly `$$` blocks.
+    output: list[str] = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        stripped = line.strip()
+        if stripped == "[":
+            output.append("$$")
+        elif stripped == "]":
+            output.append("$$")
+        else:
+            output.append(line)
+    return "\n".join(output)
+
+
+def _render_standard_answer_window(text: str, height: int) -> None:
+    rendered = _normalize_markdown_math_blocks(text)
+    try:
+        with st.container(height=height, border=True):
+            st.markdown(rendered)
+    except TypeError:
+        # Fallback for older Streamlit versions without `height` in container.
+        st.markdown(rendered)
+
+
+def _render_scroll_window(height: int, renderer) -> None:
+    try:
+        with st.container(height=height, border=True):
+            renderer()
+    except TypeError:
+        renderer()
+
+
+def _resolve_standard_answer_for_item(item: dict, item_idx: int | None = None) -> str:
+    direct = str(item.get("standard_answer", "") or "").strip()
+    if direct:
+        return direct
+
+    q_no = str(item.get("question_no", "") or "").strip()
+    mapping = _standard_answer_map()
+
+    if q_no:
+        exact = mapping.get(q_no, "")
+        if exact:
+            return exact
+
+        # Common mismatch: grader returns 1..8, standard answer uses 2.1..2.8.
+        for key, value in mapping.items():
+            if key.split(".")[-1] == q_no:
+                return value
+
+    if item_idx is not None and 0 <= item_idx < len(mapping):
+        ordered_keys = list(mapping.keys())
+        return mapping.get(ordered_keys[item_idx], "")
+
+    return ""
+
+
+def _ensure_grading_template(data: dict) -> dict:
+    grading = data.setdefault("grading", {})
+    items = grading.get("items")
+    if not isinstance(items, list) or not items:
+        grading["items"] = [
+            {
+                "question_no": "1",
+                "score": 0,
+                "max_score": 100,
+                "standard_answer": "",
+                "deduction_reason": "",
+                "comment": "",
+            }
+        ]
+
+    if "overall_comment" not in grading:
+        grading["overall_comment"] = ""
+
+    if "total_score" not in grading:
+        grading["total_score"] = sum(_safe_float(item.get("score"), 0.0) for item in grading["items"])
+
+    return grading
+
+
+def _render_pdf(file_path: Path) -> None:
+    if fitz is None:
+        st.info("当前环境缺少 PyMuPDF，无法内嵌预览 PDF。可先下载后本地查看。")
+        st.download_button("下载原始 PDF", data=file_path.read_bytes(), file_name=file_path.name)
+        return
+
+    try:
+        with fitz.open(file_path) as doc:
+            total_pages = len(doc)
+            if total_pages == 0:
+                st.warning("该 PDF 没有可预览页面。")
+                return
+
+            max_preview_pages = 20
+            pages_to_show = min(total_pages, max_preview_pages)
+            if total_pages > max_preview_pages:
+                st.caption(f"PDF 共 {total_pages} 页，当前仅预览前 {max_preview_pages} 页。")
+
+            for page_index in range(pages_to_show):
+                page = doc[page_index]
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                st.image(pix.tobytes("png"), caption=f"第 {page_index + 1} 页", use_container_width=True)
+
+    except Exception as exc:
+        st.warning(f"PDF 预览失败：{exc}")
+        st.download_button("下载原始 PDF", data=file_path.read_bytes(), file_name=file_path.name)
 
 
 def _render_docx(file_path: Path) -> None:
@@ -167,7 +465,7 @@ def _render_source_file(file_path: Path) -> None:
 
 
 def _save_current_file(current_path: Path, data: dict, key_prefix: str) -> None:
-    grading = data.setdefault("grading", {})
+    grading = _ensure_grading_template(data)
     items = grading.get("items", [])
 
     for i, item in enumerate(items):
@@ -187,6 +485,10 @@ def _save_current_file(current_path: Path, data: dict, key_prefix: str) -> None:
     grading["total_score"] = st.session_state.get(
         f"{key_prefix}_total_score", _safe_float(grading.get("total_score"), 0.0)
     )
+
+    if data.get("error"):
+        data["manual_review_override"] = True
+
     data["approved"] = bool(st.session_state.get(f"{key_prefix}_approved", False))
     data["teacher_last_modified"] = datetime.now().isoformat(timespec="seconds")
 
@@ -204,15 +506,38 @@ if not result_files:
 if "idx" not in st.session_state:
     st.session_state.idx = 0
 
+student_names = [p.stem for p in result_files]
+current_idx = min(max(int(st.session_state.idx), 0), len(result_files) - 1)
+if (
+    "quick_student_selector" not in st.session_state
+    or st.session_state.quick_student_selector not in student_names
+):
+    st.session_state.quick_student_selector = student_names[current_idx]
+
 col_nav_1, col_nav_2, col_nav_3 = st.columns([1, 2, 1])
 with col_nav_1:
     if st.button("⬅ 上一个", use_container_width=True):
         st.session_state.idx = max(0, st.session_state.idx - 1)
+        st.session_state.quick_student_selector = student_names[st.session_state.idx]
+        st.rerun()
 with col_nav_3:
     if st.button("下一个 ➡", use_container_width=True):
         st.session_state.idx = min(len(result_files) - 1, st.session_state.idx + 1)
+        st.session_state.quick_student_selector = student_names[st.session_state.idx]
+        st.rerun()
 with col_nav_2:
     st.markdown(f"**{st.session_state.idx + 1} / {len(result_files)}**")
+
+selected_name = st.selectbox(
+    "快速定位学生",
+    options=student_names,
+    key="quick_student_selector",
+    help="可输入姓名快速筛选并跳转。",
+)
+selected_idx = student_names.index(selected_name)
+if selected_idx != st.session_state.idx:
+    st.session_state.idx = selected_idx
+    st.rerun()
 
 current_file = result_files[st.session_state.idx]
 data = json.loads(current_file.read_text(encoding="utf-8"))
@@ -224,78 +549,100 @@ left, right = st.columns(2)
 
 with left:
     st.markdown("### 学生作业")
-    source_files = [Path(p) for p in data.get("student_source_files", []) if p]
+    source_files = [Path(p) for p in data.get("parsed_source_files", []) if p]
+    if not source_files:
+        source_files = [Path(p) for p in data.get("student_source_files", []) if p]
     if not source_files and data.get("student_source_file"):
         source_files = [Path(data["student_source_file"])]
 
     if not source_files:
         st.warning("未记录到原始附件路径")
     elif len(source_files) == 1:
-        _render_source_file(source_files[0])
+        _render_scroll_window(student_window_height, lambda: _render_source_file(source_files[0]))
     else:
         tab_titles = [p.name for p in source_files]
         tabs = st.tabs(tab_titles)
         for tab, src in zip(tabs, source_files):
             with tab:
-                _render_source_file(src)
+                _render_scroll_window(
+                    student_window_height,
+                    lambda src=src: _render_source_file(src),
+                )
 
 with right:
     st.markdown("### 教师可编辑评分区")
+    grading = _ensure_grading_template(data)
+
     if data.get("error"):
         st.error(f"评分错误: {data['error']}")
-    else:
-        grading = data.get("grading", {})
-        items = grading.get("items", [])
+        if data.get("needs_retry", False):
+            st.warning("该错误可重试：建议勾选左侧“仅重试上次可重试错误”后再次批改。")
 
-        calculated_total = sum(
-            _safe_float(st.session_state.get(f"{key_prefix}_item_{i}_score", item.get("score", 0)))
-            for i, item in enumerate(items)
+        st.info("你仍可在下方手动打分并填写评语；保存并审核通过后可以正常提交到 Canvas。")
+
+    items = grading.get("items", [])
+
+    calculated_total = sum(
+        _safe_float(st.session_state.get(f"{key_prefix}_item_{i}_score", item.get("score", 0)))
+        for i, item in enumerate(items)
+    )
+
+    col_total_1, col_total_2 = st.columns([2, 1])
+    with col_total_1:
+        st.number_input(
+            "总分（可手动修改）",
+            min_value=0.0,
+            value=_safe_float(grading.get("total_score"), calculated_total),
+            step=0.5,
+            key=f"{key_prefix}_total_score",
         )
+    with col_total_2:
+        if st.button("按各题重算总分", key=f"{key_prefix}_recalc_total", use_container_width=True):
+            st.session_state[f"{key_prefix}_total_score"] = calculated_total
+            st.success(f"已重算总分: {calculated_total}")
 
-        col_total_1, col_total_2 = st.columns([2, 1])
-        with col_total_1:
+    st.text_area(
+        "总评（可编辑）",
+        value=grading.get("overall_comment", ""),
+        height=100,
+        key=f"{key_prefix}_overall_comment",
+    )
+
+    for idx, item in enumerate(items, start=1):
+        max_score = _safe_float(item.get("max_score"), 100.0)
+        init_score = _safe_float(item.get("score"), 0.0)
+        current_score = _safe_float(st.session_state.get(f"{key_prefix}_item_{idx - 1}_score", init_score))
+        heat = _heat_badge_text(current_score, max_score)
+        with st.expander(f"题 {item.get('question_no', idx)}  |  {current_score:g}/{max_score:g}  |  {heat}"):
             st.number_input(
-                "总分（可手动修改）",
+                f"得分（满分 {item.get('max_score', '-')})",
                 min_value=0.0,
-                value=_safe_float(grading.get("total_score"), calculated_total),
+                max_value=max_score,
+                value=min(init_score, max_score),
                 step=0.5,
-                key=f"{key_prefix}_total_score",
+                key=f"{key_prefix}_item_{idx - 1}_score",
             )
-        with col_total_2:
-            if st.button("按各题重算总分", key=f"{key_prefix}_recalc_total", use_container_width=True):
-                st.session_state[f"{key_prefix}_total_score"] = calculated_total
-                st.success(f"已重算总分: {calculated_total}")
+            current_score = _safe_float(st.session_state.get(f"{key_prefix}_item_{idx - 1}_score", init_score))
+            _render_score_bar(current_score, max_score)
+            st.text_input(
+                "扣分原因（可编辑）",
+                value=item.get("deduction_reason", ""),
+                key=f"{key_prefix}_item_{idx - 1}_reason",
+            )
+            st.text_area(
+                "评语（可编辑）",
+                value=item.get("comment", ""),
+                height=80,
+                key=f"{key_prefix}_item_{idx - 1}_comment",
+            )
 
-        st.text_area(
-            "总评（可编辑）",
-            value=grading.get("overall_comment", ""),
-            height=100,
-            key=f"{key_prefix}_overall_comment",
-        )
-
-        for idx, item in enumerate(items, start=1):
-            with st.expander(f"题 {item.get('question_no', idx)}"):
-                max_score = _safe_float(item.get("max_score"), 100.0)
-                init_score = _safe_float(item.get("score"), 0.0)
-                st.number_input(
-                    f"得分（满分 {item.get('max_score', '-')})",
-                    min_value=0.0,
-                    max_value=max_score,
-                    value=min(init_score, max_score),
-                    step=0.5,
-                    key=f"{key_prefix}_item_{idx - 1}_score",
-                )
-                st.text_input(
-                    "扣分原因（可编辑）",
-                    value=item.get("deduction_reason", ""),
-                    key=f"{key_prefix}_item_{idx - 1}_reason",
-                )
-                st.text_area(
-                    "评语（可编辑）",
-                    value=item.get("comment", ""),
-                    height=80,
-                    key=f"{key_prefix}_item_{idx - 1}_comment",
-                )
+            standard_answer = _resolve_standard_answer_for_item(item, idx - 1)
+            st.markdown("---")
+            if standard_answer:
+                st.markdown("**标准答案**")
+                _render_standard_answer_window(standard_answer, standard_window_height)
+            else:
+                st.caption("该题暂无可展示的标准答案（请确认标准答案文件中包含可解析题号）。")
 
 st.checkbox(
     "审核通过，允许回传 Canvas",

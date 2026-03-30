@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import requests
@@ -54,14 +55,37 @@ class LLMClient:
         if response_format:
             payload["response_format"] = response_format
 
-        response = requests.post(
-            self._request_url(model),
-            headers=self._headers(),
-            json=payload,
-            timeout=self.settings.request_timeout,
-        )
-        response.raise_for_status()
-        return response.json()
+        max_attempts = max(1, self.settings.llm_max_retries + 1)
+        request_url = self._request_url(model)
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.post(
+                    request_url,
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=self.settings.request_timeout,
+                )
+
+                # Retry only transient server-side throttling/availability failures.
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    response.raise_for_status()
+
+                response.raise_for_status()
+                return response.json()
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                retryable = status_code in {429, 500, 502, 503, 504}
+                if (not retryable) or attempt >= max_attempts:
+                    raise
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt >= max_attempts:
+                    raise
+
+            sleep_seconds = self.settings.llm_retry_backoff_seconds * attempt
+            time.sleep(max(0.0, sleep_seconds))
+
+        raise RuntimeError("LLM 请求失败：超过最大重试次数")
 
     @staticmethod
     def message_text(api_result: dict[str, Any]) -> str:

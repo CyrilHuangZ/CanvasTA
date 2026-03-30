@@ -49,7 +49,7 @@ class Grader:
 请只输出合法 JSON，不要输出 Markdown：
 {{
   "total_score": 0,
-  "items": [{{"question_no":"1","score":0,"max_score":0,"deduction_reason":"","comment":""}}],
+    "items": [{{"question_no":"1","score":0,"max_score":0,"standard_answer":"","deduction_reason":"","comment":""}}],
   "overall_comment": ""
 }}
 """.strip()
