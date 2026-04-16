@@ -183,6 +183,42 @@ streamlit run canvas_ta/review_ui.py
 
 ---
 
+## 手动补交文件（非 Canvas 上传）
+
+如果有同学是线下/私下补交，请把文件复制到：
+
+- `student_submissions/assignment_<ASSIGNMENT_ID>/`
+
+推荐命名：
+
+- `<学生姓名>_<任意说明>.<扩展名>`（推荐）
+- `<学生姓名>.<扩展名>`（也支持）
+
+示例：
+
+- `王奕铭_manual_v2.pdf`
+- `王奕铭_补交_20260415.zip`
+- `Alice Wang_late.docx`
+
+要和后续“批改 + 回传”打通，请满足：
+
+- 文件名前缀中的“学生姓名”要和 Canvas 中该学生姓名完全一致
+- 同一学生多个文件时，统一使用相同的 `<学生姓名>_` 前缀
+- 文件类型沿用原有解析规则（`pdf/docx/txt/md/tex/图片/zip`）
+
+当前流程已升级为：
+
+- 第一步：正常拉取 Canvas 并批改
+- 第二步：自动扫描本地 `student_submissions/assignment_<id>/`
+- 第三步：仅当该学生没有现成 JSON 结果时，才自动执行补批改
+
+回传兼容性：
+
+- 已审核结果按 `student_name` 匹配提交对象
+- 只要该学生在作业名单中，即使 Canvas 状态是 `unsubmitted` 也可匹配
+
+---
+
 ## 标准答案格式要求（建议）
 
 为保证提取稳定、UI 展示一致，建议将标准答案维护为 Markdown 风格。

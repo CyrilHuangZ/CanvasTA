@@ -121,7 +121,7 @@ class Settings:
         configured = os.getenv("ANSWER_FILE", "").strip()
         if configured:
             configured_path = Path(configured)
-            if configured_path.exists():
+            if configured_path.exists() and configured_path.is_file():
                 return configured_path
 
         assignment_matched = _assignment_answer_file(self.answer_dir, self.assignment_id)
@@ -132,7 +132,7 @@ class Settings:
             # Keep configured path in error messages when no fallback file is found.
             return Path(configured)
 
-        return _first_file(self.answer_dir)
+        return Path("")
 
     @property
     def assignment_tag(self) -> str:

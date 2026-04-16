@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 import re
 import shutil
@@ -34,6 +35,186 @@ def _write_result_with_history(
     history_path = _result_path(run_history_dir, student_name)
     history_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return latest_path
+
+
+def _natural_sort_key(value: str):
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", value)]
+
+
+def _load_existing_result_data(results_dir: Path, student_name: str) -> dict[str, Any]:
+    existing_path = _result_path(results_dir, student_name)
+    if not existing_path.exists():
+        return {}
+
+    try:
+        return json.loads(existing_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _collect_local_submission_groups(
+    download_dir: Path,
+    student_names: set[str],
+) -> dict[str, list[Path]]:
+    if not download_dir.exists():
+        return {}
+
+    sorted_names = sorted((name for name in student_names if name), key=lambda name: (-len(name), name))
+    grouped: dict[str, list[Path]] = defaultdict(list)
+
+    for file_path in sorted(download_dir.glob("*"), key=lambda path: _natural_sort_key(path.name)):
+        if not file_path.is_file():
+            continue
+
+        matched_student = ""
+        for student_name in sorted_names:
+            if file_path.stem == student_name or file_path.name.startswith(f"{student_name}_"):
+                matched_student = student_name
+                break
+
+        # Canvas 自动下载附件命名为: 姓名_附件ID_原文件名；补批改阶段只处理手动放入的文件。
+        if matched_student and re.match(rf"^{re.escape(matched_student)}_\d+_", file_path.name):
+            continue
+
+        if matched_student:
+            grouped[matched_student].append(file_path)
+
+    return {student: files for student, files in grouped.items() if files}
+
+
+def _grade_local_pending_submissions(
+    *,
+    settings: Settings,
+    results_dir: Path,
+    history_dir: Path,
+    run_id: str,
+    all_submissions: list[Any],
+    download_dir: Path,
+    extractor: AnswerExtractor,
+    grader: Grader,
+    standard_answer: str,
+    grading_total_questions: int | None,
+    retry_failed_only: bool,
+    skip_approved: bool,
+    reuse_valid_results: bool,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    progress_total: int,
+) -> tuple[int, int, int]:
+    submissions_by_name = {
+        s.user["name"]: s
+        for s in all_submissions
+        if getattr(s, "user", None) and isinstance(s.user, dict) and s.user.get("name")
+    }
+    local_groups = _collect_local_submission_groups(download_dir, set(submissions_by_name.keys()))
+
+    if not local_groups:
+        return 0, 0, 0
+
+    print(
+        f"\n检测到本地手动附件候选: {len(local_groups)} 名学生，"
+        "仅对无现有结果 JSON 的学生执行补批改"
+    )
+
+    ok_count = err_count = skip_count = 0
+    for student_name, source_paths in local_groups.items():
+        result_path = _result_path(results_dir, student_name)
+        existing_data = _load_existing_result_data(results_dir, student_name)
+
+        if result_path.exists() and not retry_failed_only:
+            skip_count += 1
+            continue
+
+        if (not reuse_valid_results) and skip_approved and existing_data.get("approved", False):
+            skip_count += 1
+            continue
+
+        if retry_failed_only and existing_data:
+            if not existing_data.get("needs_retry", False):
+                skip_count += 1
+                continue
+
+        if _is_valid_existing_result(existing_data):
+            skip_count += 1
+            continue
+
+        submission = submissions_by_name.get(student_name)
+        user_id = getattr(submission, "user_id", None) if submission is not None else None
+
+        print(f"\n[{student_name}] 使用本地补交文件补批改")
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "grading",
+                    "message": f"正在补批改本地文件: {student_name}",
+                    "current": progress_total,
+                    "total": progress_total,
+                    "student_name": student_name,
+                }
+            )
+
+        try:
+            route, student_text, parsed_files = extractor.load_student_answers(source_paths)
+            if not student_text:
+                raise ValueError("提取到的文本为空")
+
+            grading = grader.grade_answer(
+                student_text,
+                standard_answer,
+                total_questions=grading_total_questions,
+            )
+            result_data: dict[str, Any] = {
+                "student_name": student_name,
+                "user_id": user_id,
+                "assignment_id": settings.assignment_id,
+                "run_id": run_id,
+                "files": [p.name for p in source_paths],
+                "student_source_files": [str(p) for p in source_paths],
+                "parsed_source_files": parsed_files,
+                "extract_route": route,
+                "student_answer_text": student_text,
+                "grading": grading,
+                "approved": False,
+                "needs_retry": False,
+                "submission_source": "manual_local_files",
+            }
+            ok_count += 1
+        except Exception as exc:
+            retryable = _is_retryable_error(str(exc))
+            result_data = {
+                "student_name": student_name,
+                "user_id": user_id,
+                "assignment_id": settings.assignment_id,
+                "run_id": run_id,
+                "files": [p.name for p in source_paths],
+                "student_source_files": [str(p) for p in source_paths],
+                "approved": False,
+                "error": str(exc),
+                "needs_retry": retryable,
+                "submission_source": "manual_local_files",
+            }
+            err_count += 1
+
+        latest_path = _write_result_with_history(
+            latest_dir=results_dir,
+            history_dir=history_dir,
+            run_id=run_id,
+            student_name=student_name,
+            data=result_data,
+        )
+        print(f"补批改结果已保存: {latest_path}")
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "saved",
+                    "message": f"已保存补批改结果: {student_name}",
+                    "current": progress_total,
+                    "total": progress_total,
+                    "student_name": student_name,
+                }
+            )
+
+    return ok_count, err_count, skip_count
 
 
 def run_grading_pipeline(
@@ -88,7 +269,6 @@ def run_grading_pipeline(
     processed_submitted = 0
     for submission in all_submissions:
         if submission.workflow_state == "unsubmitted":
-            skip_count += 1
             continue
 
         processed_submitted += 1
@@ -98,13 +278,7 @@ def run_grading_pipeline(
         user_id = submission.user_id
         print(f"\n[{student_name}] 开始处理")
 
-        existing_path = _result_path(results_dir, student_name)
-        existing_data: dict[str, Any] = {}
-        if existing_path.exists():
-            try:
-                existing_data = json.loads(existing_path.read_text(encoding="utf-8"))
-            except Exception:
-                existing_data = {}
+        existing_data = _load_existing_result_data(results_dir, student_name)
 
         existing_result_is_valid = _is_valid_existing_result(existing_data)
 
@@ -292,6 +466,32 @@ def run_grading_pipeline(
                 }
             )
 
+    local_ok, local_err, local_skip = _grade_local_pending_submissions(
+        settings=settings,
+        results_dir=results_dir,
+        history_dir=history_dir,
+        run_id=run_id,
+        all_submissions=all_submissions,
+        download_dir=download_dir,
+        extractor=extractor,
+        grader=grader,
+        standard_answer=standard_answer,
+        grading_total_questions=grading_total_questions,
+        retry_failed_only=retry_failed_only,
+        skip_approved=skip_approved,
+        reuse_valid_results=reuse_valid_results,
+        progress_callback=progress_callback,
+        progress_total=total_submitted,
+    )
+    ok_count += local_ok
+    err_count += local_err
+    skip_count += local_skip
+
+    if local_ok or local_err:
+        print(
+            f"本地补批改完成: 成功 {local_ok} | 出错 {local_err} | 跳过 {local_skip}"
+        )
+
     print("\n" + "=" * 60)
     print(f"完成: 成功 {ok_count} | 出错 {err_count} | 跳过 {skip_count}")
     print(f"请审阅 {results_dir} 中的 JSON，可在审阅 UI 中直接提交，或使用 submit_results.py。")
@@ -465,6 +665,35 @@ def _submit_one_data(
         return False, f"回传失败 {student_name}: {exc}"
 
 
+def _persist_submit_result(
+    *,
+    file_path: Path,
+    data: dict[str, Any],
+    ok: bool,
+    message: str,
+) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    normalized = message.strip()
+
+    if ok:
+        data["canvas_submit_status"] = "success"
+        data["canvas_submit_message"] = normalized
+        data["canvas_submitted_at"] = now
+    elif normalized.startswith("回传失败"):
+        data["canvas_submit_status"] = "failed"
+        data["canvas_submit_message"] = normalized
+        data["canvas_submit_failed_at"] = now
+    elif normalized.startswith("跳过"):
+        data["canvas_submit_status"] = "skipped"
+        data["canvas_submit_message"] = normalized
+    else:
+        data["canvas_submit_status"] = "failed"
+        data["canvas_submit_message"] = normalized
+        data["canvas_submit_failed_at"] = now
+
+    file_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def submit_single_result_file(file_path: Path) -> tuple[bool, str]:
     settings = Settings()
     canvas = CanvasService(settings)
@@ -472,16 +701,18 @@ def submit_single_result_file(file_path: Path) -> tuple[bool, str]:
         s.user["name"]
         : s
         for s in canvas.list_submissions()
-        if s.workflow_state != "unsubmitted"
+        if getattr(s, "user", None) and isinstance(s.user, dict) and s.user.get("name")
     }
 
     data = json.loads(file_path.read_text(encoding="utf-8"))
-    return _submit_one_data(
+    ok, message = _submit_one_data(
         data,
         submissions_by_name=submissions_by_name,
         canvas=canvas,
         settings=settings,
     )
+    _persist_submit_result(file_path=file_path, data=data, ok=ok, message=message)
+    return ok, message
 
 
 def submit_approved_results_with_stats(
@@ -500,7 +731,7 @@ def submit_approved_results_with_stats(
         s.user["name"]
         : s
         for s in canvas.list_submissions()
-        if s.workflow_state != "unsubmitted"
+        if getattr(s, "user", None) and isinstance(s.user, dict) and s.user.get("name")
     }
 
     success = skipped = failed = 0
@@ -513,6 +744,7 @@ def submit_approved_results_with_stats(
             canvas=canvas,
             settings=settings,
         )
+        _persist_submit_result(file_path=file_path, data=data, ok=ok, message=message)
         print(message)
         if ok:
             success += 1

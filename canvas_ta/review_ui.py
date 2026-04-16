@@ -205,6 +205,11 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _clamp_score(value: float, *, max_score: float) -> float:
+    upper = max(0.0, max_score)
+    return min(max(0.0, value), upper)
+
+
 def _score_ratio(score: float, max_score: float) -> float:
     if max_score <= 0:
         return 0.0
@@ -464,14 +469,35 @@ def _render_source_file(file_path: Path) -> None:
     st.download_button("下载原始附件", data=file_path.read_bytes(), file_name=file_path.name)
 
 
-def _save_current_file(current_path: Path, data: dict, key_prefix: str) -> None:
+def _student_status_text(data: dict) -> str:
+    status = str(data.get("canvas_submit_status", "")).strip().lower()
+    if status == "success" or data.get("canvas_submitted_at"):
+        return "📤已回传"
+    if bool(data.get("approved", False)):
+        return "✅已审核"
+    if data.get("error"):
+        return "⚠️待处理"
+    return "📝待审核"
+
+
+def _save_current_file(
+    current_path: Path,
+    data: dict,
+    key_prefix: str,
+    *,
+    force_approved: bool = False,
+) -> None:
     grading = _ensure_grading_template(data)
     items = grading.get("items", [])
 
     for i, item in enumerate(items):
-        item["score"] = st.session_state.get(
-            f"{key_prefix}_item_{i}_score", _safe_float(item.get("score"), 0.0)
+        score_key = f"{key_prefix}_item_{i}_score"
+        max_score = max(0.0, _safe_float(item.get("max_score"), 100.0))
+        raw_score = _safe_float(
+            st.session_state.get(score_key, _safe_float(item.get("score"), 0.0)),
+            0.0,
         )
+        item["score"] = _clamp_score(raw_score, max_score=max_score)
         item["deduction_reason"] = st.session_state.get(
             f"{key_prefix}_item_{i}_reason", item.get("deduction_reason", "")
         )
@@ -482,14 +508,18 @@ def _save_current_file(current_path: Path, data: dict, key_prefix: str) -> None:
     grading["overall_comment"] = st.session_state.get(
         f"{key_prefix}_overall_comment", grading.get("overall_comment", "")
     )
-    grading["total_score"] = st.session_state.get(
-        f"{key_prefix}_total_score", _safe_float(grading.get("total_score"), 0.0)
+    total_key = f"{key_prefix}_total_score"
+    total_raw = _safe_float(
+        st.session_state.get(total_key, _safe_float(grading.get("total_score"), 0.0)),
+        0.0,
     )
+    grading["total_score"] = max(0.0, total_raw)
 
     if data.get("error"):
         data["manual_review_override"] = True
 
-    data["approved"] = bool(st.session_state.get(f"{key_prefix}_approved", False))
+    approved_from_widget = bool(st.session_state.get(f"{key_prefix}_approved", False))
+    data["approved"] = True if force_approved else approved_from_widget
     data["teacher_last_modified"] = datetime.now().isoformat(timespec="seconds")
 
     current_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -507,6 +537,14 @@ if "idx" not in st.session_state:
     st.session_state.idx = 0
 
 student_names = [p.stem for p in result_files]
+student_status_map: dict[str, str] = {}
+for file_path in result_files:
+    try:
+        result_data = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception:
+        result_data = {}
+    student_status_map[file_path.stem] = _student_status_text(result_data)
+
 current_idx = min(max(int(st.session_state.idx), 0), len(result_files) - 1)
 if (
     "quick_student_selector" not in st.session_state
@@ -531,6 +569,7 @@ with col_nav_2:
 selected_name = st.selectbox(
     "快速定位学生",
     options=student_names,
+    format_func=lambda name: f"{name}  [{student_status_map.get(name, '📝待审核')}]",
     key="quick_student_selector",
     help="可输入姓名快速筛选并跳转。",
 )
@@ -583,23 +622,36 @@ with right:
     items = grading.get("items", [])
 
     calculated_total = sum(
-        _safe_float(st.session_state.get(f"{key_prefix}_item_{i}_score", item.get("score", 0)))
+        _clamp_score(
+            _safe_float(st.session_state.get(f"{key_prefix}_item_{i}_score", item.get("score", 0))),
+            max_score=max(0.0, _safe_float(item.get("max_score"), 100.0)),
+        )
         for i, item in enumerate(items)
     )
+    total_key = f"{key_prefix}_total_score"
+    total_override_key = f"{key_prefix}_total_score_override"
+    total_init = max(0.0, _safe_float(grading.get("total_score"), calculated_total))
+    if total_override_key in st.session_state:
+        st.session_state[total_key] = max(
+            0.0,
+            _safe_float(st.session_state.pop(total_override_key), calculated_total),
+        )
+    if total_key in st.session_state:
+        st.session_state[total_key] = max(0.0, _safe_float(st.session_state.get(total_key), total_init))
 
     col_total_1, col_total_2 = st.columns([2, 1])
     with col_total_1:
         st.number_input(
             "总分（可手动修改）",
             min_value=0.0,
-            value=_safe_float(grading.get("total_score"), calculated_total),
+            value=total_init,
             step=0.5,
-            key=f"{key_prefix}_total_score",
+            key=total_key,
         )
     with col_total_2:
         if st.button("按各题重算总分", key=f"{key_prefix}_recalc_total", use_container_width=True):
-            st.session_state[f"{key_prefix}_total_score"] = calculated_total
-            st.success(f"已重算总分: {calculated_total}")
+            st.session_state[total_override_key] = max(0.0, calculated_total)
+            st.rerun()
 
     st.text_area(
         "总评（可编辑）",
@@ -609,20 +661,29 @@ with right:
     )
 
     for idx, item in enumerate(items, start=1):
-        max_score = _safe_float(item.get("max_score"), 100.0)
-        init_score = _safe_float(item.get("score"), 0.0)
-        current_score = _safe_float(st.session_state.get(f"{key_prefix}_item_{idx - 1}_score", init_score))
+        max_score = max(0.0, _safe_float(item.get("max_score"), 100.0))
+        init_score = _clamp_score(_safe_float(item.get("score"), 0.0), max_score=max_score)
+        score_key = f"{key_prefix}_item_{idx - 1}_score"
+        current_score = _clamp_score(
+            _safe_float(st.session_state.get(score_key, init_score), init_score),
+            max_score=max_score,
+        )
+        if score_key in st.session_state:
+            st.session_state[score_key] = current_score
         heat = _heat_badge_text(current_score, max_score)
         with st.expander(f"题 {item.get('question_no', idx)}  |  {current_score:g}/{max_score:g}  |  {heat}"):
             st.number_input(
                 f"得分（满分 {item.get('max_score', '-')})",
                 min_value=0.0,
                 max_value=max_score,
-                value=min(init_score, max_score),
+                value=current_score,
                 step=0.5,
-                key=f"{key_prefix}_item_{idx - 1}_score",
+                key=score_key,
             )
-            current_score = _safe_float(st.session_state.get(f"{key_prefix}_item_{idx - 1}_score", init_score))
+            current_score = _clamp_score(
+                _safe_float(st.session_state.get(score_key, current_score), current_score),
+                max_score=max_score,
+            )
             _render_score_bar(current_score, max_score)
             st.text_input(
                 "扣分原因（可编辑）",
@@ -658,9 +719,9 @@ with col_action_1:
 
 with col_action_2:
     if st.button("保存并标记审核通过", use_container_width=True):
-        st.session_state[f"{key_prefix}_approved"] = True
-        _save_current_file(current_file, data, key_prefix)
+        _save_current_file(current_file, data, key_prefix, force_approved=True)
         st.success("已保存并标记为审核通过")
+        st.rerun()
 
 with col_action_3:
     if st.button("提交当前学生到 Canvas", use_container_width=True):

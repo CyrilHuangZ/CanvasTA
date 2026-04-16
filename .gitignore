@@ -19,6 +19,10 @@ Results/
 student_submissions/
 *.log
 
+# Keep only one canonical standard-answer file in repository
+Answer/*
+!Answer/Hw1 Solution 35418.md
+
 # Notebook artifacts
 .ipynb_checkpoints/
 
